@@ -1,0 +1,8 @@
+.venv/
+venv/
+data/
+csv_extract/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+_test_fixture_*
