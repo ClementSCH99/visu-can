@@ -49,10 +49,23 @@ def main() -> None:
         st.info("Add an NDJSON or CSV file to the data folder to get started.")
         return
 
-    summary = cached_compute_dataset_summary(str(source_file), get_file_signature(source_file))
+    st.sidebar.header("Controls")
+    series_cells_text = st.sidebar.text_input(
+        "Cells in series (Ns)", value="",
+        help="Required only for the terminal-voltage-per-cell estimate; enter the actual series count.",
+    ).strip()
+    series_cells: int | None = None
+    if series_cells_text:
+        try:
+            series_cells = int(series_cells_text)
+            if series_cells < 1:
+                raise ValueError
+        except ValueError:
+            st.sidebar.error("Cells in series must be a positive integer.")
+
+    summary = cached_compute_dataset_summary(str(source_file), get_file_signature(source_file), series_cells)
     show_dataset_summary(summary)
 
-    st.sidebar.header("Controls")
     scan_limit_enabled = st.sidebar.checkbox("Limit signal discovery scan", value=True)
     scan_limit = st.sidebar.number_input(
         "Discovery rows",
@@ -202,7 +215,7 @@ def main() -> None:
 
     st.plotly_chart(
         build_figure(dataset, HOVER_MODE_OPTIONS[hover_mode_label], axis_assignments),
-        use_container_width=True,
+        width="stretch",
     )
     export_mode_label = st.selectbox(
         "CSV export mode",
@@ -318,9 +331,10 @@ def cached_signal_index(
 def cached_compute_dataset_summary(
     file_path: str,
     file_signature: tuple[str, int, int],
+    series_cells: int | None,
 ) -> DatasetSummary | None:
     del file_signature
-    return compute_dataset_summary(file_path)
+    return compute_dataset_summary(file_path, series_cells=series_cells)
 
 
 def get_file_signature(file_path: Path) -> tuple[str, int, int]:
@@ -392,7 +406,7 @@ def show_signal_summary(summaries: list[SignalSummary]) -> None:
                 "signal": [summary.name for summary in summaries],
                 "samples": [summary.samples for summary in summaries],
             },
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -407,56 +421,84 @@ def show_dataset_summary(summary: DatasetSummary | None) -> None:
     if summary is None:
         return
     with st.expander("Dataset summary", expanded=True):
+        st.caption("Whole CSV recording; start and end values are medians over the first and last 5 s.")
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown("**Capacity & Energy**")
-            st.table(
-                {
-                    "Metric": [
-                        "Charged capacity",
-                        "Discharged capacity",
-                        "Charged energy",
-                        "Discharged energy",
-                    ],
-                    "Value": [
-                        _fmt(summary.charged_capacity_ah, 3, "Ah"),
-                        _fmt(summary.discharged_capacity_ah, 3, "Ah"),
-                        _fmt(summary.charged_energy_kwh, 4, "kWh"),
-                        _fmt(summary.discharged_energy_kwh, 4, "kWh"),
-                    ],
-                }
-            )
+            st.markdown("**Capacity and energy**")
+            st.table({
+                "Metric": ["Capacity charged", "Capacity discharged", "Capacity net", "Energy charged", "Energy discharged", "Energy net"],
+                "Value": [
+                    _fmt(summary.capacity_ah.charged, 3, "Ah"),
+                    _fmt(summary.capacity_ah.discharged, 3, "Ah"),
+                    _fmt(summary.capacity_ah.net, 3, "Ah"),
+                    _fmt(summary.energy_kwh.charged, 4, "kWh"),
+                    _fmt(summary.energy_kwh.discharged, 4, "kWh"),
+                    _fmt(summary.energy_kwh.net, 4, "kWh"),
+                ],
+            })
+            st.markdown("**Cell voltages**")
+            def extreme_label(extreme) -> str:
+                value = _fmt(extreme.value_v, 4, "V")
+                return f"{value} ({extreme.cell_id}, t={extreme.time_s:.1f} s)" if extreme.cell_id and extreme.time_s is not None else value
+
+            st.table({
+                "Metric": ["Absolute minimum", "Absolute maximum", "Cell delta at start", "Maximum cell delta", "Cell delta at end", "Vpack/Ns at start", "Vpack/Ns at end"],
+                "Value": [
+                    extreme_label(summary.min_cell_voltage),
+                    extreme_label(summary.max_cell_voltage),
+                    _fmt(summary.cell_voltage_delta_mv.start, 1, "mV"),
+                    _fmt(summary.cell_voltage_delta_mv.maximum, 1, "mV"),
+                    _fmt(summary.cell_voltage_delta_mv.end, 1, "mV"),
+                    _fmt(summary.equivalent_cell_voltage_v.start, 4, "V"),
+                    _fmt(summary.equivalent_cell_voltage_v.end, 4, "V"),
+                ],
+            })
         with col2:
-            st.markdown("**Temperature**")
-            st.table(
-                {
-                    "Metric": [
-                        "Avg temp at start",
-                        "Avg max temp",
-                    ],
-                    "Value": [
-                        _fmt(summary.avg_temp_start_c, 1, "°C"),
-                        _fmt(summary.avg_max_temp_c, 1, "°C"),
-                    ],
-                }
+            st.markdown("**Temperatures**")
+            battery = summary.battery_temp_c
+            coldest = summary.min_cell_temp_c
+            hottest = summary.max_cell_temp_c
+            spread = summary.cell_temp_delta_c
+            st.table({
+                "Signal": ["Battery average", "Coldest cell", "Hottest cell", "Cell spread"],
+                "Start": [
+                    _fmt(battery.start, 2, "°C"),
+                    _fmt(coldest.start, 2, "°C"),
+                    _fmt(hottest.start, 2, "°C"),
+                    _fmt(spread.start, 2, "°C"),
+                ],
+                "During recording": [
+                    f"Min {_fmt(battery.minimum, 2, '°C')} · Max {_fmt(battery.maximum, 2, '°C')}",
+                    f"Min {_fmt(coldest.minimum, 2, '°C')}",
+                    f"Max {_fmt(hottest.maximum, 2, '°C')}",
+                    f"Max {_fmt(spread.maximum, 2, '°C')}",
+                ],
+                "End": [
+                    _fmt(battery.end, 2, "°C"),
+                    _fmt(coldest.end, 2, "°C"),
+                    _fmt(hottest.end, 2, "°C"),
+                    _fmt(spread.end, 2, "°C"),
+                ],
+            })
+            rise = battery.end - battery.start if battery.end is not None and battery.start is not None else None
+            st.caption(
+                f"Battery time average: {_fmt(battery.average, 2, '°C')} · "
+                f"Start-to-end rise: {_fmt(rise, 2, '°C')}"
             )
-            st.markdown("**Cell Voltages**")
-            st.table(
-                {
-                    "Metric": [
-                        "Min cell voltage",
-                        "Max cell voltage",
-                        "Initial imbalance",
-                    ],
-                    "Value": [
-                        _fmt(summary.min_cell_voltage_v, 4, "V")
-                        + (f"  ({summary.min_cell_voltage_id})" if summary.min_cell_voltage_id else ""),
-                        _fmt(summary.max_cell_voltage_v, 4, "V")
-                        + (f"  ({summary.max_cell_voltage_id})" if summary.max_cell_voltage_id else ""),
-                        _fmt(summary.initial_cell_imbalance_mv, 1, "mV"),
-                    ],
-                }
-            )
+
+        st.markdown("**Data quality**")
+        duration = summary.duration_s
+        current_coverage = f"{summary.capacity_ah.covered_s / duration:.1%}" if duration > 0 else "N/A"
+        power_coverage = f"{summary.energy_kwh.covered_s / duration:.1%}" if duration > 0 else "N/A"
+        st.caption(
+            f"Duration: {duration:.1f} s · Current coverage: {summary.capacity_ah.covered_s:.1f} s "
+            f"({current_coverage}) · "
+            f"Power coverage: {summary.energy_kwh.covered_s:.1f} s "
+            f"({power_coverage}) · "
+            f"Complete cell snapshots: {summary.complete_cell_snapshots}/{summary.total_rows}"
+        )
+        for warning in summary.warnings:
+            st.warning(warning)
 
 
 def select_axis_assignments(selected_signals: list[str]) -> dict[str, str]:

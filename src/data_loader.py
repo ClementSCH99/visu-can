@@ -10,6 +10,8 @@ import numpy as np
 import orjson
 import pandas as pd
 
+from .summary import DatasetSummary, compute_dataset_summary
+
 
 @dataclass(frozen=True)
 class SignalSummary:
@@ -44,21 +46,6 @@ class PlotDataset:
     last_timestamp: float | None
 
 
-@dataclass(frozen=True)
-class DatasetSummary:
-    charged_capacity_ah: float | None
-    discharged_capacity_ah: float | None
-    charged_energy_kwh: float | None
-    discharged_energy_kwh: float | None
-    avg_temp_start_c: float | None
-    avg_max_temp_c: float | None
-    min_cell_voltage_v: float | None
-    min_cell_voltage_id: str | None
-    max_cell_voltage_v: float | None
-    max_cell_voltage_id: str | None
-    initial_cell_imbalance_mv: float | None
-
-
 _CSV_METADATA_COLUMNS = frozenset({"can_id", "dlc", "data_hex"})
 # Columns tried in order; first match becomes the time axis
 _TIMESTAMP_CANDIDATES = ("timestamp", "timestamp_s", "nhr_monotonic_s", "nhr_timestamp_utc")
@@ -91,12 +78,15 @@ def _build_signal_index_from_csv(file_path: str | Path, row_limit: int | None = 
     else:
         ts_values = pd.to_numeric(df[ts_col], errors="coerce")
 
-    df = df.assign(_ts=ts_values)
-    df = df[np.isfinite(df["_ts"])].sort_values("_ts", kind="stable").reset_index(drop=True)
+    # Keep timestamps separate: adding a column to a wide CSV frame fragments it.
+    timestamps = ts_values.to_numpy(dtype=float)
+    valid_rows = np.flatnonzero(np.isfinite(timestamps))
+    sorted_rows = valid_rows[np.argsort(timestamps[valid_rows], kind="stable")]
+    df = df.iloc[sorted_rows].reset_index(drop=True)
     if df.empty:
         return empty
 
-    ts_array = df["_ts"].to_numpy(dtype=float)
+    ts_array = timestamps[sorted_rows]
     ts_array = ts_array - ts_array[0]
     row_ids_base = np.arange(1, len(df) + 1, dtype=np.int64)
     meta_cols = _CSV_METADATA_COLUMNS | {"_ts", ts_col}
@@ -334,154 +324,3 @@ def downsample_series(values: list[float], max_points: int) -> list[float]:
     if sampled[-1] != values[-1]:
         sampled.append(values[-1])
     return sampled
-
-
-_CELL_TEMP_PREFIX = "can_CELL_T_"
-_CELL_VOLT_PREFIX = "can_CELL_V_"
-_START_WINDOW_S = 60.0
-
-
-def compute_dataset_summary(file_path: str | Path) -> "DatasetSummary | None":
-    path = Path(file_path)
-    if path.suffix.lower() != ".csv":
-        return None
-
-    df = pd.read_csv(file_path)
-    if df.empty:
-        return None
-
-    ts_col = next((c for c in _TIMESTAMP_CANDIDATES if c in df.columns), None)
-    if ts_col is None:
-        return None
-
-    if ts_col == "nhr_timestamp_utc":
-        ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce").astype("int64") / 1e9
-    else:
-        ts = pd.to_numeric(df[ts_col], errors="coerce")
-
-    first_valid_ts = ts.dropna().iloc[0] if not ts.dropna().empty else 0.0
-    ts = ts - first_valid_ts
-
-    # --- Capacity ---
-    charged_capacity_ah: float | None = None
-    discharged_capacity_ah: float | None = None
-
-    if "nhr_capacity_charge_ah" in df.columns:
-        col = pd.to_numeric(df["nhr_capacity_charge_ah"], errors="coerce").dropna()
-        if not col.empty:
-            charged_capacity_ah = float(col.iloc[-1] - col.iloc[0])
-
-    if "nhr_capacity_discharge_ah" in df.columns:
-        col = pd.to_numeric(df["nhr_capacity_discharge_ah"], errors="coerce").dropna()
-        if not col.empty:
-            discharged_capacity_ah = float(col.iloc[-1] - col.iloc[0])
-
-    if (charged_capacity_ah is None or discharged_capacity_ah is None) and "nhr_current_a" in df.columns:
-        current = pd.to_numeric(df["nhr_current_a"], errors="coerce")
-        valid_mask = current.notna() & ts.notna()
-        if valid_mask.sum() > 1:
-            t = ts[valid_mask].to_numpy(dtype=float)
-            i = current[valid_mask].to_numpy(dtype=float)
-            if charged_capacity_ah is None:
-                charged_capacity_ah = float(np.trapezoid(np.where(i > 0, i, 0.0), t) / 3600)
-            if discharged_capacity_ah is None:
-                discharged_capacity_ah = float(np.trapezoid(np.where(i < 0, -i, 0.0), t) / 3600)
-
-    # --- Energy ---
-    charged_energy_kwh: float | None = None
-    discharged_energy_kwh: float | None = None
-
-    if "nhr_energy_charge_kwh" in df.columns:
-        col = pd.to_numeric(df["nhr_energy_charge_kwh"], errors="coerce").dropna()
-        if not col.empty:
-            charged_energy_kwh = float(col.iloc[-1] - col.iloc[0])
-
-    if "nhr_energy_discharge_kwh" in df.columns:
-        col = pd.to_numeric(df["nhr_energy_discharge_kwh"], errors="coerce").dropna()
-        if not col.empty:
-            discharged_energy_kwh = float(col.iloc[-1] - col.iloc[0])
-
-    if (charged_energy_kwh is None or discharged_energy_kwh is None) and "nhr_power_w" in df.columns:
-        power = pd.to_numeric(df["nhr_power_w"], errors="coerce")
-        valid_mask = power.notna() & ts.notna()
-        if valid_mask.sum() > 1:
-            t = ts[valid_mask].to_numpy(dtype=float)
-            p = power[valid_mask].to_numpy(dtype=float)
-            if charged_energy_kwh is None:
-                charged_energy_kwh = float(np.trapezoid(np.where(p > 0, p, 0.0), t) / 3_600_000)
-            if discharged_energy_kwh is None:
-                discharged_energy_kwh = float(np.trapezoid(np.where(p < 0, -p, 0.0), t) / 3_600_000)
-
-    # --- Temperature (CAN cell sensors; fall back to NHR instrument if absent) ---
-    temp_cols = [
-        c for c in df.columns
-        if c.startswith(_CELL_TEMP_PREFIX)
-        and not any(c.endswith(s) for s in _SIGNAL_SUFFIX_EXCLUDE)
-    ]
-    if not temp_cols and "nhr_temperature_c" in df.columns:
-        temp_cols = ["nhr_temperature_c"]
-
-    avg_temp_start_c: float | None = None
-    avg_max_temp_c: float | None = None
-
-    if temp_cols:
-        temp_df = df[temp_cols].apply(pd.to_numeric, errors="coerce")
-        start_mask = ts <= _START_WINDOW_S
-
-        start_vals = temp_df[start_mask].to_numpy().flatten()
-        start_vals = start_vals[~np.isnan(start_vals)]
-        if len(start_vals) > 0:
-            avg_temp_start_c = float(np.mean(start_vals))
-
-        col_maxes = temp_df.max(skipna=True).dropna()
-        if not col_maxes.empty:
-            avg_max_temp_c = float(col_maxes.mean())
-
-    # --- Cell voltages ---
-    cell_v_cols = [
-        c for c in df.columns
-        if c.startswith(_CELL_VOLT_PREFIX)
-        and not any(c.endswith(s) for s in _SIGNAL_SUFFIX_EXCLUDE)
-    ]
-
-    min_cell_voltage_v: float | None = None
-    min_cell_voltage_id: str | None = None
-    max_cell_voltage_v: float | None = None
-    max_cell_voltage_id: str | None = None
-    initial_cell_imbalance_mv: float | None = None
-
-    if cell_v_cols:
-        cell_v_df = df[cell_v_cols].apply(pd.to_numeric, errors="coerce")
-
-        col_mins = cell_v_df.min(skipna=True).dropna()
-        if not col_mins.empty:
-            min_col = col_mins.idxmin()
-            min_cell_voltage_v = float(col_mins[min_col])
-            min_cell_voltage_id = min_col.removeprefix("can_")
-
-        col_maxes = cell_v_df.max(skipna=True).dropna()
-        if not col_maxes.empty:
-            max_col = col_maxes.idxmax()
-            max_cell_voltage_v = float(col_maxes[max_col])
-            max_cell_voltage_id = max_col.removeprefix("can_")
-
-        # Initial imbalance: median voltage per cell over the first window, then max - min
-        start_mask = ts <= _START_WINDOW_S
-        start_cell = cell_v_df[start_mask]
-        cell_medians = start_cell.median(skipna=True).dropna()
-        if len(cell_medians) > 1:
-            initial_cell_imbalance_mv = float((cell_medians.max() - cell_medians.min()) * 1000)
-
-    return DatasetSummary(
-        charged_capacity_ah=charged_capacity_ah,
-        discharged_capacity_ah=discharged_capacity_ah,
-        charged_energy_kwh=charged_energy_kwh,
-        discharged_energy_kwh=discharged_energy_kwh,
-        avg_temp_start_c=avg_temp_start_c,
-        avg_max_temp_c=avg_max_temp_c,
-        min_cell_voltage_v=min_cell_voltage_v,
-        min_cell_voltage_id=min_cell_voltage_id,
-        max_cell_voltage_v=max_cell_voltage_v,
-        max_cell_voltage_id=max_cell_voltage_id,
-        initial_cell_imbalance_mv=initial_cell_imbalance_mv,
-    )

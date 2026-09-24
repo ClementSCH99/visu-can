@@ -6,3 +6,4 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 _test_fixture_*
+.codex_tmp/
